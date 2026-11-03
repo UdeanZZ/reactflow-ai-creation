@@ -1,74 +1,174 @@
 "use client";
 
-import { useState, useRef, useEffect, type FormEvent } from "react";
+import { useState, useRef, useEffect, useCallback, type FormEvent } from "react";
 import { Send, RotateCcw, Bot } from "lucide-react";
 import { useFlowStore } from "@/store/flowStore";
 import { buildConfig } from "@/lib/buildPrompt";
 import type { ChatMessage } from "@/types/nodes";
 
+// ---------------------------------------------------------------------------
+// StreamingBubble
+// Renders already-committed text plus the live streaming suffix, animating
+// each new word as it arrives (ChatGPT-style).
+// ---------------------------------------------------------------------------
+
+interface StreamingBubbleProps {
+  /** The full text accumulated so far from the stream */
+  content: string;
+  /** Word index to start animating from — words before this are "settled" */
+  animateFromWord: number;
+}
+
+function StreamingBubble({ content, animateFromWord }: StreamingBubbleProps) {
+  // Split on whitespace but keep the separator so spaces are preserved
+  const words = content.split(/(\s+)/);
+
+  let wordIdx = 0;
+  return (
+    <span>
+      {words.map((fragment, i) => {
+        // Whitespace-only fragments are not real words — render as-is
+        if (/^\s+$/.test(fragment)) {
+          return <span key={i}>{fragment}</span>;
+        }
+        const idx = wordIdx++;
+        const shouldAnimate = idx >= animateFromWord;
+        return (
+          <span
+            key={i}
+            className={shouldAnimate ? "animate-word-appear" : undefined}
+            style={
+              shouldAnimate
+                ? { animationDelay: `${Math.max(0, (idx - animateFromWord) * 18)}ms` }
+                : undefined
+            }
+          >
+            {fragment}
+          </span>
+        );
+      })}
+    </span>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// ChatInterface
+// ---------------------------------------------------------------------------
+
 /**
  * Full chat UI that reads the current flow config and talks to the Gemini
- * API via the `/api/chat` route handler.
+ * API via the `/api/chat` route handler.  Responses are streamed and rendered
+ * word-by-word with a fade-in animation.
  */
 export function ChatInterface() {
   const { nodes, edges, chatMessages, addChatMessage, clearChat } =
     useFlowStore();
+
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  /**
+   * While streaming, we hold the partial reply here.  Once the stream is
+   * finished we move the text into the persistent store and clear this.
+   */
+  const [streamingContent, setStreamingContent] = useState<string | null>(null);
+  /**
+   * The word index at which we started the current streaming turn — used by
+   * StreamingBubble to know which words are "new" (should animate).
+   */
+  const animateFromWordRef = useRef(0);
+
   const bottomRef = useRef<HTMLDivElement>(null);
+  const abortRef = useRef<AbortController | null>(null);
 
   const config = buildConfig(nodes, edges);
 
-  // Scroll to bottom when new messages arrive
+  // Scroll to bottom when new messages or streaming content arrives
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [chatMessages]);
+  }, [chatMessages, streamingContent]);
 
-  async function handleSubmit(e: FormEvent) {
-    e.preventDefault();
-    const text = input.trim();
-    if (!text || loading) return;
+  const handleSubmit = useCallback(
+    async (e: FormEvent) => {
+      e.preventDefault();
+      const text = input.trim();
+      if (!text || loading) return;
 
-    setInput("");
-    setError(null);
+      setInput("");
+      setError(null);
 
-    const userMsg: ChatMessage = {
-      id: `msg-${Date.now()}`,
-      role: "user",
-      content: text,
-      timestamp: Date.now(),
-    };
-    addChatMessage(userMsg);
-    setLoading(true);
-
-    try {
-      const response = await fetch("/api/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: text, config }),
-      });
-
-      if (!response.ok) {
-        const err = await response.json().catch(() => ({}));
-        throw new Error(err.error ?? `Request failed (${response.status})`);
-      }
-
-      const { reply } = await response.json();
-
-      const assistantMsg: ChatMessage = {
-        id: `msg-${Date.now() + 1}`,
-        role: "assistant",
-        content: reply,
+      const userMsg: ChatMessage = {
+        id: `msg-${Date.now()}`,
+        role: "user",
+        content: text,
         timestamp: Date.now(),
       };
-      addChatMessage(assistantMsg);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Something went wrong.");
-    } finally {
-      setLoading(false);
-    }
-  }
+      addChatMessage(userMsg);
+      setLoading(true);
+
+      // Reset streaming state for a fresh turn
+      animateFromWordRef.current = 0;
+      setStreamingContent("");
+
+      const controller = new AbortController();
+      abortRef.current = controller;
+
+      try {
+        const response = await fetch("/api/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ message: text, config }),
+          signal: controller.signal,
+        });
+
+        if (!response.ok) {
+          const err = await response.json().catch(() => ({}));
+          throw new Error(err.error ?? `Request failed (${response.status})`);
+        }
+
+        // The route now returns text/plain as a ReadableStream
+        if (!response.body) throw new Error("No response body.");
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let accumulated = "";
+
+        // eslint-disable-next-line no-constant-condition
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          const chunk = decoder.decode(value, { stream: true });
+
+          // Track the word boundary so StreamingBubble only animates new words
+          const prevWordCount = accumulated.split(/\s+/).filter(Boolean).length;
+          accumulated += chunk;
+          animateFromWordRef.current = prevWordCount;
+
+          setStreamingContent(accumulated);
+        }
+
+        // Stream finished — commit to the persistent store
+        const assistantMsg: ChatMessage = {
+          id: `msg-${Date.now() + 1}`,
+          role: "assistant",
+          content: accumulated,
+          timestamp: Date.now(),
+        };
+        addChatMessage(assistantMsg);
+        setStreamingContent(null);
+      } catch (err) {
+        if (err instanceof Error && err.name === "AbortError") return;
+        setError(err instanceof Error ? err.message : "Something went wrong.");
+        setStreamingContent(null);
+      } finally {
+        setLoading(false);
+        abortRef.current = null;
+      }
+    },
+    [input, loading, config, addChatMessage]
+  );
 
   // Determine the greeting to show in the empty state
   const greeting = config.greeting || "Hello! How can I help you today?";
@@ -102,7 +202,7 @@ export function ChatInterface() {
         aria-label="Chat messages"
         aria-live="polite"
       >
-        {chatMessages.length === 0 ? (
+        {chatMessages.length === 0 && streamingContent === null ? (
           <div className="flex flex-col items-center justify-center h-full gap-3 text-center">
             <div className="w-12 h-12 rounded-full bg-violet-100 dark:bg-violet-900/30 flex items-center justify-center text-2xl">
               🤖
@@ -117,32 +217,45 @@ export function ChatInterface() {
             </div>
           </div>
         ) : (
-          chatMessages.map((msg) => (
-            <div
-              key={msg.id}
-              className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}
-            >
+          <>
+            {chatMessages.map((msg) => (
               <div
-                className={`max-w-[85%] rounded-2xl px-3.5 py-2.5 text-sm leading-relaxed ${
-                  msg.role === "user"
-                    ? "bg-violet-600 text-white rounded-br-sm"
-                    : "bg-zinc-100 dark:bg-zinc-800 text-zinc-800 dark:text-zinc-100 rounded-bl-sm"
-                }`}
+                key={msg.id}
+                className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}
               >
-                {msg.content}
+                <div
+                  className={`max-w-[85%] rounded-2xl px-3.5 py-2.5 text-sm leading-relaxed ${
+                    msg.role === "user"
+                      ? "bg-violet-600 text-white rounded-br-sm"
+                      : "bg-zinc-100 dark:bg-zinc-800 text-zinc-800 dark:text-zinc-100 rounded-bl-sm"
+                  }`}
+                >
+                  {msg.content}
+                </div>
               </div>
-            </div>
-          ))
-        )}
+            ))}
 
-        {loading && (
-          <div className="flex justify-start">
-            <div className="bg-zinc-100 dark:bg-zinc-800 rounded-2xl rounded-bl-sm px-4 py-3 flex gap-1 items-center">
-              <span className="w-1.5 h-1.5 rounded-full bg-zinc-400 animate-bounce [animation-delay:0ms]" />
-              <span className="w-1.5 h-1.5 rounded-full bg-zinc-400 animate-bounce [animation-delay:150ms]" />
-              <span className="w-1.5 h-1.5 rounded-full bg-zinc-400 animate-bounce [animation-delay:300ms]" />
-            </div>
-          </div>
+            {/* Live streaming bubble */}
+            {streamingContent !== null && (
+              <div className="flex justify-start">
+                <div className="max-w-[85%] rounded-2xl rounded-bl-sm px-3.5 py-2.5 text-sm leading-relaxed bg-zinc-100 dark:bg-zinc-800 text-zinc-800 dark:text-zinc-100">
+                  {streamingContent.length === 0 ? (
+                    /* Still waiting for the very first chunk — show the dots */
+                    <span className="flex gap-1 items-center">
+                      <span className="w-1.5 h-1.5 rounded-full bg-zinc-400 animate-bounce [animation-delay:0ms]" />
+                      <span className="w-1.5 h-1.5 rounded-full bg-zinc-400 animate-bounce [animation-delay:150ms]" />
+                      <span className="w-1.5 h-1.5 rounded-full bg-zinc-400 animate-bounce [animation-delay:300ms]" />
+                    </span>
+                  ) : (
+                    <StreamingBubble
+                      content={streamingContent}
+                      animateFromWord={animateFromWordRef.current}
+                    />
+                  )}
+                </div>
+              </div>
+            )}
+          </>
         )}
 
         {error && (
